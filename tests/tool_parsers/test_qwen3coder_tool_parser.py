@@ -1481,6 +1481,104 @@ def test_adjust_request_auto_uses_vllm_registry_structural_tag(
     assert isinstance(loaded, dict)
 
 
+def test_streaming_mtp_param_and_function_end_same_delta(
+    qwen3_tool_parser, qwen3_tokenizer
+):
+    """Regression: MTP can deliver the last parameter and close tag together."""
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+
+    deltas = [
+        "<tool_call>",
+        "\n<function=get_current_weather>",
+        "\n",
+        "<parameter=city>\nDallas\n</parameter>",
+        "<parameter=state>\nTX\n</parameter>",
+        "\n<parameter=unit>\nfahrenheit\n</parameter>\n</function>",
+        "\n</tool_call>",
+    ]
+
+    from tests.tool_parsers.utils import run_tool_extraction_streaming
+
+    reconstructor = run_tool_extraction_streaming(
+        qwen3_tool_parser,
+        deltas,
+        request,
+        assert_one_tool_per_delta=False,
+    )
+
+    assert len(reconstructor.tool_calls) == 1
+    args = json.loads(reconstructor.tool_calls[0].function.arguments)
+    assert args == {"city": "Dallas", "state": "TX", "unit": "fahrenheit"}
+
+    stored_args = json.loads(qwen3_tool_parser.prev_tool_call_arr[0]["arguments"])
+    assert stored_args == {"city": "Dallas", "state": "TX", "unit": "fahrenheit"}
+    assert qwen3_tool_parser.streamed_args_for_tool[0].endswith("}")
+
+
+def test_streaming_mtp_param_function_end_and_tool_end_same_delta(
+    qwen3_tool_parser, qwen3_tokenizer
+):
+    """Regression: MTP can deliver param, function end, and tool end together."""
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+
+    deltas = [
+        "<tool_call>",
+        "\n<function=get_current_weather>",
+        "\n",
+        "<parameter=city>\nDallas\n</parameter>",
+        "<parameter=state>\nTX\n</parameter>",
+        "\n<parameter=unit>\nfahrenheit\n</parameter>\n</function>\n</tool_call>",
+    ]
+
+    from tests.tool_parsers.utils import run_tool_extraction_streaming
+
+    reconstructor = run_tool_extraction_streaming(
+        qwen3_tool_parser,
+        deltas,
+        request,
+        assert_one_tool_per_delta=False,
+    )
+
+    assert len(reconstructor.tool_calls) == 1
+    args = json.loads(reconstructor.tool_calls[0].function.arguments)
+    assert args == {"city": "Dallas", "state": "TX", "unit": "fahrenheit"}
+
+    stored_args = json.loads(qwen3_tool_parser.prev_tool_call_arr[0]["arguments"])
+    assert stored_args == {"city": "Dallas", "state": "TX", "unit": "fahrenheit"}
+    assert qwen3_tool_parser.streamed_args_for_tool[0].endswith("}")
+
+
+def test_streaming_non_mtp_unchanged(qwen3_tool_parser, qwen3_tokenizer):
+    """Verify normal streaming still works after the early-return fix."""
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+
+    deltas = [
+        "<tool_call>",
+        "\n<function=get_current_weather>",
+        "\n",
+        "<parameter=city>\nDallas\n</parameter>",
+        "\n</function>",
+        "\n</tool_call>",
+    ]
+
+    from tests.tool_parsers.utils import run_tool_extraction_streaming
+
+    reconstructor = run_tool_extraction_streaming(
+        qwen3_tool_parser,
+        deltas,
+        request,
+        assert_one_tool_per_delta=False,
+    )
+
+    assert len(reconstructor.tool_calls) == 1
+    args = json.loads(reconstructor.tool_calls[0].function.arguments)
+    assert args == {"city": "Dallas"}
+
+    stored_args = json.loads(qwen3_tool_parser.prev_tool_call_arr[0]["arguments"])
+    assert stored_args == {"city": "Dallas"}
+    assert qwen3_tool_parser.streamed_args_for_tool[0].endswith("}")
+
+
 def test_adjust_request_required_prefers_structural_tag(
     monkeypatch: pytest.MonkeyPatch,
     qwen3_tool_parser: Qwen3CoderToolParser,
