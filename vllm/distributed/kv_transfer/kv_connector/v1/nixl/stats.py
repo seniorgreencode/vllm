@@ -4,7 +4,7 @@
 
 import copy
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -15,13 +15,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetric,
     PromMetricT,
 )
-from vllm.distributed.nixl_utils import nixlXferTelemetry
 from vllm.v1.metrics.utils import create_metric_per_engine
+
+if TYPE_CHECKING:
+    from vllm.distributed.nixl_utils import nixlXferTelemetry
 
 
 @dataclass
 class NixlKVConnectorStats(KVConnectorStats):
-    """Container for transfer performance metrics"""
+    """Container for transfer performance metrics."""
 
     def __post_init__(self):
         if not self.data:
@@ -37,10 +39,11 @@ class NixlKVConnectorStats(KVConnectorStats):
             "num_descriptors": [],
             "num_failed_transfers": [],
             "num_failed_notifications": [],
+            "num_failed_handshakes": [],
             "num_kv_expired_reqs": [],
         }
 
-    def record_transfer(self, res: nixlXferTelemetry):
+    def record_transfer(self, res: "nixlXferTelemetry"):
         # Keep metrics units consistent with rest of the code: time us->s
         self.data["transfer_duration"].append(res.xferDuration / 1e6)
         self.data["post_duration"].append(res.postDuration / 1e6)
@@ -54,6 +57,10 @@ class NixlKVConnectorStats(KVConnectorStats):
     def record_failed_notification(self):
         """Record a failed NIXL notification (send_notif)."""
         self.data["num_failed_notifications"].append(1)
+
+    def record_failed_handshake(self):
+        """Record a failed NIXL handshake."""
+        self.data["num_failed_handshakes"].append(1)
 
     def record_kv_expired_req(self):
         """Record a request that had its KV blocks expire."""
@@ -70,6 +77,7 @@ class NixlKVConnectorStats(KVConnectorStats):
             self.num_successful_transfers == 0
             and len(self.data["num_failed_transfers"]) == 0
             and len(self.data["num_failed_notifications"]) == 0
+            and len(self.data["num_failed_handshakes"]) == 0
             and len(self.data["num_kv_expired_reqs"]) == 0
         )
 
@@ -82,10 +90,22 @@ class NixlKVConnectorStats(KVConnectorStats):
         return self
 
     def reduce(self) -> dict[str, int | float]:
-        # Compute compact representative stats suitable for CLI logging
+        # Compute compact representative stats suitable for CLI logging.
+        # Failure counts are reported on every interval: transfer, handshake
+        # and notification failures are grouped as sporadic
+        # lower-transport-layer events, while KV expiry is reported separately
+        # as it is an actionable autoscaler signal rather than a transport
+        # issue.
+        failure_counts = {
+            "Num failed transfers": len(self.data["num_failed_transfers"])
+            + len(self.data["num_failed_handshakes"])
+            + len(self.data["num_failed_notifications"]),
+            "Num KV expired reqs": len(self.data["num_kv_expired_reqs"]),
+        }
         if self.num_successful_transfers == 0:
-            # CLI logging only reports successful transfers stats. If all requests in
-            # the interval were unsuccessful, Prom will report failures stats instead.
+            # Timing / throughput stats only cover successful transfers. If
+            # all requests in the interval were unsuccessful, the failure
+            # counts above still surface what happened.
             return {
                 "Num successful transfers": 0,
                 "Avg xfer time (ms)": 0,
@@ -95,6 +115,7 @@ class NixlKVConnectorStats(KVConnectorStats):
                 "Avg MB per transfer": 0,
                 "Throughput (MB/s)": 0,
                 "Avg number of descriptors": 0,
+                **failure_counts,
             }
 
         xfer_time = np.asarray(self.data["transfer_duration"])
@@ -113,13 +134,14 @@ class NixlKVConnectorStats(KVConnectorStats):
 
         return {
             "Num successful transfers": n,
-            "Avg xfer time (ms)": round(xfer_time.mean() * 1e3, 3),
+            "Avg xfer time (ms)": round(xfer_time.mean().item() * 1e3, 3),
             "P90 xfer time (ms)": round(np.percentile(xfer_time, 90).item() * 1e3, 3),
-            "Avg post time (ms)": round(post_time.mean() * 1e3, 3),
+            "Avg post time (ms)": round(post_time.mean().item() * 1e3, 3),
             "P90 post time (ms)": round(np.percentile(post_time, 90).item() * 1e3, 3),
-            "Avg MB per transfer": round(avg_mb, 3),
-            "Throughput (MB/s)": round(throughput_mb_s, 3),
-            "Avg number of descriptors": round(descs.mean(), 1),
+            "Avg MB per transfer": round(avg_mb.item(), 3),
+            "Throughput (MB/s)": round(throughput_mb_s.item(), 3),
+            "Avg number of descriptors": round(descs.mean().item(), 1),
+            **failure_counts,
         }
 
     @property
@@ -210,15 +232,20 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         )
         counter_nixl_num_failed_transfers = self._counter_cls(
             name="vllm:nixl_num_failed_transfers",
-            documentation="Number of failed NIXL KV Cache transfers.",
+            documentation="Number of failed NIXL KV Cache transfers, including"
+            " handshake and notification failures. NOTE: KV expiry is tracked"
+            " separately in vllm:nixl_num_kv_expired_reqs.",
             labelnames=labelnames,
         )
         self.counter_nixl_num_failed_transfers = create_metric_per_engine(
             counter_nixl_num_failed_transfers, self.per_engine_labelvalues
         )
+
         counter_nixl_num_failed_notifications = self._counter_cls(
             name="vllm:nixl_num_failed_notifications",
-            documentation="Number of failed NIXL KV Cache notifications.",
+            documentation="Number of failed NIXL KV Cache notifications. "
+            "Retained for compatibility; these failures are also included in "
+            "vllm:nixl_num_failed_transfers.",
             labelnames=labelnames,
         )
         self.counter_nixl_num_failed_notifications = create_metric_per_engine(
@@ -252,13 +279,26 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         ):
             for list_item in transfer_stats_data[list_item_key]:
                 prom_obj[engine_idx].observe(list_item)
-        for counter_obj, counter_item_key in zip(
+        for counter_obj, counter_item_keys in zip(
             [
                 self.counter_nixl_num_failed_transfers,
                 self.counter_nixl_num_failed_notifications,
                 self.counter_nixl_num_kv_expired_reqs,
             ],
-            ["num_failed_transfers", "num_failed_notifications", "num_kv_expired_reqs"],
+            [
+                # Transfer, handshake and notification failures are grouped:
+                # all are sporadic lower-transport-layer events. KV expiry is
+                # reported separately as it signals autoscaler behavior, not
+                # transport health.
+                (
+                    "num_failed_transfers",
+                    "num_failed_handshakes",
+                    "num_failed_notifications",
+                ),
+                ("num_failed_notifications",),
+                ("num_kv_expired_reqs",),
+            ],
         ):
-            for list_item in transfer_stats_data[counter_item_key]:
-                counter_obj[engine_idx].inc(list_item)
+            for counter_item_key in counter_item_keys:
+                for list_item in transfer_stats_data[counter_item_key]:
+                    counter_obj[engine_idx].inc(list_item)
