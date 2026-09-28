@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use std::sync::Arc;
 
 use axum::Json;
@@ -10,11 +13,14 @@ use serde_json::json;
 
 use crate::state::{ApiKeyHash, AppState, hash_api_key};
 
-const GUARDED_PREFIXES: &[&str] = &["/v1", "/v2", "/inference"];
+/// The paths that answer without the API key: the liveness probe and the
+/// load/version endpoints used by orchestrators. Every other route on the
+/// app, present or added later, requires a bearer token by default.
+const UNGUARDED_PATHS: &[&str] = &["/health", "/load", "/version"];
 
 /// Authenticate guarded HTTP routes with an OpenAI-compatible bearer token.
 ///
-/// Mirrors Python `AuthenticationMiddleware`: OPTIONS requests and non-guarded
+/// Mirrors Python `AuthenticationMiddleware`: OPTIONS requests and unguarded
 /// helper endpoints such as `/health` are allowed through without a token.
 pub async fn authenticate_api_key(
     State(state): State<Arc<AppState>>,
@@ -37,7 +43,7 @@ pub async fn authenticate_api_key(
 }
 
 fn requires_auth(path: &str) -> bool {
-    GUARDED_PREFIXES.iter().any(|prefix| path.starts_with(prefix))
+    !UNGUARDED_PATHS.contains(&path)
 }
 
 fn verify_token(authorization: Option<&HeaderValue>, api_key_hashes: &[ApiKeyHash]) -> bool {
