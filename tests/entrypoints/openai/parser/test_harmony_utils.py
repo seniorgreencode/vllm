@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+from openai.types.responses import FunctionTool
 from openai_harmony import DeveloperContent, Message, Role
 
 from tests.entrypoints.openai.utils import verify_harmony_messages
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionToolsParam
 from vllm.entrypoints.openai.parser.harmony_utils import (
     auto_drop_analysis_messages,
+    create_tool_definition,
     extract_function_from_recipient,
     get_encoding,
     get_streamable_parser_for_assistant,
@@ -15,11 +18,65 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     is_function_recipient,
     parse_chat_input_to_harmony_message,
     parse_chat_output,
+    parse_output_into_messages,
 )
 from vllm.entrypoints.openai.responses.harmony import (
     response_input_to_harmony,
     response_previous_input_to_harmony,
 )
+from vllm.exceptions import VLLMValidationError
+
+_TOOL_PARAMETERS = {
+    "type": "object",
+    "properties": {"status": {"type": "string"}},
+    "required": ["status"],
+    "additionalProperties": False,
+}
+
+
+class TestCreateToolDefinition:
+    def test_chat_completion_omitted_description_defaults_to_empty_string(self):
+        tool = ChatCompletionToolsParam(
+            function={
+                "name": "report_status",
+                "parameters": _TOOL_PARAMETERS,
+            }
+        )
+
+        tool_definition = create_tool_definition(tool)
+
+        assert tool_definition.name == "report_status"
+        assert tool_definition.description == ""
+        assert tool_definition.parameters == _TOOL_PARAMETERS
+
+    def test_chat_completion_none_description_defaults_to_empty_string(self):
+        tool = ChatCompletionToolsParam(
+            function={
+                "name": "report_status",
+                "description": None,
+                "parameters": _TOOL_PARAMETERS,
+            }
+        )
+
+        tool_definition = create_tool_definition(tool)
+
+        assert tool_definition.name == "report_status"
+        assert tool_definition.description == ""
+        assert tool_definition.parameters == _TOOL_PARAMETERS
+
+    def test_response_tool_none_description_defaults_to_empty_string(self):
+        tool = FunctionTool(
+            name="report_status",
+            description=None,
+            parameters=_TOOL_PARAMETERS,
+            type="function",
+        )
+
+        tool_definition = create_tool_definition(tool)
+
+        assert tool_definition.name == "report_status"
+        assert tool_definition.description == ""
+        assert tool_definition.parameters == _TOOL_PARAMETERS
 
 
 class TestIsFunctionRecipient:
@@ -117,7 +174,7 @@ class TestIsFunctionRecipientWithAllowedNames:
     """Tests for is_function_recipient with allowed_function_tool_names."""
 
     def test_prefixed_always_accepted(self):
-        """functions. prefix is always accepted regardless of allowed names."""
+        """Functions. prefix is always accepted regardless of allowed names."""
         fn_names = frozenset({"other_tool"})
         assert is_function_recipient("functions.get_weather", fn_names) is True
 
@@ -199,8 +256,7 @@ class TestExtractFunctionFromRecipient:
 
 
 class TestCommonParseInputToHarmonyMessage:
-    """
-    Tests for scenarios that are common to both Chat Completion
+    """Tests for scenarios that are common to both Chat Completion
     parse_chat_input_to_harmony_message and Responses API
     response_previous_input_to_harmony functions.
     """
@@ -395,8 +451,7 @@ class TestCommonParseInputToHarmonyMessage:
 
 
 class TestParseChatInputToHarmonyMessage:
-    """
-    Tests for scenarios that are specific to the Chat Completion API
+    """Tests for scenarios that are specific to the Chat Completion API
     parse_chat_input_to_harmony_message function.
     """
 
@@ -948,6 +1003,17 @@ class TestParseChatOutput:
         assert reasoning == "I've thought hard about this."
         assert final_content == "The answer is 4."
 
+    def test_parse_output_into_messages_processes_after_stop_token(self) -> None:
+        harmony_str = (
+            "<|channel|>analysis<|message|>I've thought hard about this.<|end|>"
+            "<|start|>assistant<|channel|>final<|message|>The answer is 4.<|end|>"
+        )
+        token_ids = get_encoding().encode(harmony_str, allowed_special="all")
+        parser = parse_output_into_messages(token_ids)
+        assert [msg.channel for msg in parser.messages] == ["analysis", "final"]
+        assert parser.messages[0].content[0].text == "I've thought hard about this."
+        assert parser.messages[1].content[0].text == "The answer is 4."
+
     def test_parse_chat_output_commentary_with_recipient_excluded(self) -> None:
         """Commentary with a recipient (tool call) should not appear in
         final_content — those are handled separately by the tool parser.
@@ -1027,10 +1093,11 @@ class TestGetSystemMessage:
 
     def test_unsupported_reasoning_effort_raises_clear_error(self) -> None:
         with pytest.raises(
-            ValueError,
+            VLLMValidationError,
             match="reasoning_effort='max' is not supported by Harmony",
-        ):
+        ) as exc_info:
             get_system_message(reasoning_effort="max")
+        assert exc_info.value.parameter == "reasoning_effort"
 
 
 class TestResponseInputToHarmonyReasoningItem:
