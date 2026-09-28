@@ -3,7 +3,6 @@
 
 import ast
 import json
-import keyword as _python_keyword
 import math
 import warnings
 from dataclasses import dataclass
